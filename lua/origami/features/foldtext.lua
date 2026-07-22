@@ -223,6 +223,7 @@ local function renderFoldedSegments(win, buf, foldstart, leftcol, data)
 		virt_text_win_col = wincol,
 		hl_mode = "combine",
 		ephemeral = true, -- only for decorators in a redraw cycle
+		priority = config.foldtext.priority,
 	})
 
 	return foldend

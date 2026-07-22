@@ -23,6 +23,7 @@ local defaultConfig = {
 		diagnosticsCount = true, -- uses hlgroups and icons from `vim.diagnostic.config().signs`
 		gitsignsCount = true, -- requires `gitsigns.nvim`
 		disableOnFt = { "snacks_picker_input" }, ---@type string[]
+		priority = nil, ---@type number? extmark priority, `nil` uses nvim's default
 	},
 	autoFold = {
 		enabled = true,
