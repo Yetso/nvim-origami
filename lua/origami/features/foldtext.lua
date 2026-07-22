@@ -2,7 +2,15 @@ local ns = vim.api.nvim_create_namespace("origami.foldText")
 
 ---@alias Origami.VirtTextChunk {[1]: string, [2]?: string[]}
 
----@alias Origami.FoldtextComponentProvider fun(buf: number, foldstart: number, foldend: number): Origami.VirtTextChunk[]
+---@alias Origami.FoldtextComponentProvider fun(data: Origami.FoldtextRedrawData, foldstart: number, foldend: number): Origami.VirtTextChunk[]
+
+---Data fetched once per window redraw and shared by all folds in it
+---@class Origami.FoldtextRedrawData
+---@field diagnostics vim.Diagnostic[]
+---@field diagIcons string[]
+---@field diagHls string[]
+---@field gitsignsHunks? table[] hunks from `gitsigns.get_hunks()`
+---@field miniDiffHunks? table[] hunks from `MiniDiff.get_buf_data().hunks`
 
 --------------------------------------------------------------------------------
 
@@ -24,21 +32,46 @@ end
 
 --------------------------------------------------------------------------------
 
----@type Origami.FoldtextComponentProvider
-local function getDiagnosticsInFold(buf, foldstart, foldend)
-	local diagnosticsDisabled = vim.diagnostic.is_enabled { bufnr = buf } == false
-	if diagnosticsDisabled then return {} end
+---@param buf number
+---@param config Origami.config
+---@return Origami.FoldtextRedrawData
+local function getRedrawData(buf, config)
+	local data = { ---@type Origami.FoldtextRedrawData
+		diagnostics = {},
+		diagIcons = { "E", "W", "I", "H" },
+		diagHls = { "DiagnosticError", "DiagnosticWarn", "DiagnosticInfo", "DiagnosticHint" },
+	}
 
-	-- get config from `vim.diagnostic.config`
-	local signConfig = vim.diagnostic.config().signs
-	if type(signConfig) == "function" then signConfig = signConfig(_, buf) end -- see #24
-	local diagIcons = { "E", "W", "I", "H" }
-	local diagHls = { "DiagnosticError", "DiagnosticWarn", "DiagnosticInfo", "DiagnosticHint" }
-	if type(signConfig) == "table" then
-		diagIcons = signConfig.text or diagIcons
-		diagHls = signConfig.linehl or diagHls
+	local diagnosticsEnabled = vim.diagnostic.is_enabled { bufnr = buf }
+	if config.foldtext.diagnosticsCount and diagnosticsEnabled then
+		data.diagnostics = vim.diagnostic.get(buf)
+
+		-- get config from `vim.diagnostic.config`
+		local signConfig = vim.diagnostic.config().signs
+		if type(signConfig) == "function" then signConfig = signConfig(_, buf) end -- see #24
+		if type(signConfig) == "table" then
+			data.diagIcons = signConfig.text or data.diagIcons
+			data.diagHls = signConfig.linehl or data.diagHls
+		end
 	end
 
+	-- checked on every redraw, so git plugins loaded after `nvim-origami` are used
+	if config.foldtext.gitsignsCount then
+		local gitsignsInstalled, gitsigns = pcall(require, "gitsigns")
+		local minidiffInstalled, MiniDiff = pcall(require, "mini.diff")
+		if gitsignsInstalled then
+			data.gitsignsHunks = gitsigns.get_hunks(buf) or {}
+		elseif minidiffInstalled then
+			local bufData = MiniDiff.get_buf_data(buf)
+			data.miniDiffHunks = bufData and bufData.hunks or {}
+		end
+	end
+
+	return data
+end
+
+---@type Origami.FoldtextComponentProvider
+local function getDiagnosticsInFold(data, foldstart, foldend)
 	-- get count by severity in the folded lines
 	local diagsInFold = {
 		[vim.diagnostic.severity.ERROR] = 0,
@@ -46,7 +79,7 @@ local function getDiagnosticsInFold(buf, foldstart, foldend)
 		[vim.diagnostic.severity.INFO] = 0,
 		[vim.diagnostic.severity.HINT] = 0,
 	}
-	for _, diag in pairs(vim.diagnostic.get(buf)) do
+	for _, diag in pairs(data.diagnostics) do
 		local lnum = diag.lnum + 1
 		if lnum > foldstart and lnum <= foldend then -- exclude 1st folded line since still visible
 			diagsInFold[diag.severity] = diagsInFold[diag.severity] + 1
@@ -58,25 +91,22 @@ local function getDiagnosticsInFold(buf, foldstart, foldend)
 	for severity = vim.diagnostic.severity.ERROR, vim.diagnostic.severity.HINT do
 		if diagsInFold[severity] > 0 then
 			table.insert(chunks, { " " }) -- separate, so the padding does not get hlgroup
-			local text = diagIcons[severity] .. diagsInFold[severity]
-			table.insert(chunks, { text, { diagHls[severity] } })
+			local text = data.diagIcons[severity] .. diagsInFold[severity]
+			table.insert(chunks, { text, { data.diagHls[severity] } })
 		end
 	end
 	return chunks
 end
 
 ---@type Origami.FoldtextComponentProvider
-local function getGitHunksInFold(buf, foldstart, foldend)
-	local gitsignsInstalled, gitsigns = pcall(require, "gitsigns")
-	if not gitsignsInstalled then return {} end
-
+local function getGitHunksInFold(data, foldstart, foldend)
 	local typeIcons = { change = "~", delete = "-", add = "+" }
 	local typeHls = { change = "GitSignsChange", delete = "GitSignsDelete", add = "GitSignsAdd" }
 
 	-- get count by type in the folded lines: for deletions check if deletion is
 	-- in the fold, for additions/changes, calculate the overlap of hunk and fold
 	local hunksInFold = { change = 0, delete = 0, add = 0 }
-	for _, h in pairs(gitsigns.get_hunks(buf) or {}) do
+	for _, h in pairs(data.gitsignsHunks) do
 		if h.type == "delete" then
 			local deletionLine = h.added.start -- SIC even for deletions, correctly shifted line is in `.added`
 			local isInFold = deletionLine >= foldstart and deletionLine <= foldend
@@ -105,21 +135,15 @@ local function getGitHunksInFold(buf, foldstart, foldend)
 end
 
 ---@type Origami.FoldtextComponentProvider
-local function getGitHunksInFoldWithMiniDiff(buf, foldstart, foldend)
-	local minidiffInstalled, MiniDiff = pcall(require, "mini.diff")
-	if not minidiffInstalled then return {} end
-
+local function getGitHunksInFoldWithMiniDiff(data, foldstart, foldend)
 	local typeIcons = { change = "~", delete = "-", add = "+" }
 	local typeHls =
 		{ change = "MiniDiffSignChange", delete = "MiniDiffSignDelete", add = "MiniDiffSignAdd" }
 
-	local buf_data = MiniDiff.get_buf_data(buf)
-	if not buf_data or not buf_data.hunks then return {} end
-
 	-- get count by type in the folded lines: for deletions check if deletion is
 	-- in the fold, for additions/changes, calculate the overlap of hunk and fold
 	local hunksInFold = { change = 0, delete = 0, add = 0 }
-	for _, h in ipairs(buf_data.hunks) do
+	for _, h in ipairs(data.miniDiffHunks) do
 		if h.type == "delete" then
 			local deletionLine = h.buf_start > 0 and h.buf_start or 1
 			local isInFold = deletionLine >= foldstart and deletionLine <= foldend
@@ -151,8 +175,10 @@ end
 ---@param win number
 ---@param buf number
 ---@param foldstart number
+---@param leftcol number
+---@param data Origami.FoldtextRedrawData
 ---@return number foldend
-local function renderFoldedSegments(win, buf, foldstart)
+local function renderFoldedSegments(win, buf, foldstart, leftcol, data)
 	local config = require("origami.config").config
 	local foldend = vim.fn.foldclosedend(foldstart)
 
@@ -162,20 +188,16 @@ local function renderFoldedSegments(win, buf, foldstart)
 		{ lineCountText, { config.foldtext.lineCount.hlgroup } },
 	}
 	if config.foldtext.diagnosticsCount then
-		local diagnostics = getDiagnosticsInFold(buf, foldstart, foldend)
+		local diagnostics = getDiagnosticsInFold(data, foldstart, foldend)
 		if #diagnostics > 0 then table.insert(virtText, { " " }) end
 		vim.list_extend(virtText, diagnostics)
 	end
 	if config.foldtext.gitsignsCount then
 		local hunks = {} ---@type Origami.VirtTextChunk[]
-		local gitsignsInstalled, _ = pcall(require, "gitsigns")
-		if gitsignsInstalled then
-			hunks = getGitHunksInFold(buf, foldstart, foldend)
-		else
-			local minidiffInstalled, _ = pcall(require, "mini.diff")
-			if minidiffInstalled then
-				hunks = getGitHunksInFoldWithMiniDiff(buf, foldstart, foldend)
-			end
+		if data.gitsignsHunks then
+			hunks = getGitHunksInFold(data, foldstart, foldend)
+		elseif data.miniDiffHunks then
+			hunks = getGitHunksInFoldWithMiniDiff(data, foldstart, foldend)
 		end
 		if #hunks > 0 then table.insert(virtText, { " " }) end
 		vim.list_extend(virtText, hunks)
@@ -193,11 +215,8 @@ local function renderFoldedSegments(win, buf, foldstart)
 		config.foldtext.padding.hlgroup,
 	})
 
-	-- add text as extmark
-	local line = vim.api.nvim_buf_get_lines(buf, foldstart - 1, foldstart, false)[1]
-	local wininfo = vim.fn.getwininfo(win)[1]
-	local leftcol = wininfo and wininfo.leftcol or 0 ---@diagnostic disable-line: undefined-field
-	local wincol = math.max(0, vim.fn.virtcol { foldstart, line:len() } - leftcol)
+	-- add text as extmark (`virtcol` of `$` is one past the end of the line)
+	local wincol = math.max(0, vim.fn.virtcol { foldstart, "$" } - 1 - leftcol)
 
 	vim.api.nvim_buf_set_extmark(buf, ns, foldstart - 1, 0, {
 		virt_text = virtText,
@@ -211,13 +230,21 @@ end
 
 vim.api.nvim_set_decoration_provider(ns, {
 	on_win = function(_, win, buf, topline, botline)
-		local disabledFts = require("origami.config").config.foldtext.disableOnFt
-		if vim.list_contains(disabledFts, vim.bo[buf].filetype) then return end
+		local config = require("origami.config").config
+		if vim.list_contains(config.foldtext.disableOnFt, vim.bo[buf].filetype) then return end
+
+		local wininfo = vim.fn.getwininfo(win)[1]
+		local leftcol = wininfo and wininfo.leftcol or 0 ---@diagnostic disable-line: undefined-field
+		local data ---@type Origami.FoldtextRedrawData? only fetched if there is a closed fold
+
 		vim.api.nvim_win_call(win, function()
 			local line = topline
 			while line <= botline do
 				local foldstart = vim.fn.foldclosed(line)
-				if foldstart > -1 then line = renderFoldedSegments(win, buf, foldstart) end
+				if foldstart > -1 then
+					data = data or getRedrawData(buf, config)
+					line = renderFoldedSegments(win, buf, foldstart, leftcol, data)
+				end
 				line = line + 1
 			end
 		end)
