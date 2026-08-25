@@ -79,7 +79,7 @@ local function getDiagnosticsInFold(data, foldstart, foldend)
 		[vim.diagnostic.severity.INFO] = 0,
 		[vim.diagnostic.severity.HINT] = 0,
 	}
-	for _, diag in pairs(data.diagnostics) do
+	for _, diag in ipairs(data.diagnostics) do
 		local lnum = diag.lnum + 1
 		if lnum > foldstart and lnum <= foldend then -- exclude 1st folded line since still visible
 			diagsInFold[diag.severity] = diagsInFold[diag.severity] + 1
@@ -88,10 +88,10 @@ local function getDiagnosticsInFold(data, foldstart, foldend)
 
 	-- convert count info into virtual text table for `set_extmark`
 	local chunks = {} ---@type Origami.VirtTextChunk[]
-	for severity = vim.diagnostic.severity.ERROR, vim.diagnostic.severity.HINT do
-		if diagsInFold[severity] > 0 then
+	for severity, count in ipairs(diagsInFold) do
+		if count > 0 then
 			table.insert(chunks, { " " }) -- separate, so the padding does not get hlgroup
-			local text = data.diagIcons[severity] .. diagsInFold[severity]
+			local text = data.diagIcons[severity] .. count
 			table.insert(chunks, { text, { data.diagHls[severity] } })
 		end
 	end
@@ -106,7 +106,7 @@ local function getGitHunksInFold(data, foldstart, foldend)
 	-- get count by type in the folded lines: for deletions check if deletion is
 	-- in the fold, for additions/changes, calculate the overlap of hunk and fold
 	local hunksInFold = { change = 0, delete = 0, add = 0 }
-	for _, h in pairs(data.gitsignsHunks) do
+	for _, h in ipairs(data.gitsignsHunks) do
 		if h.type == "delete" then
 			local deletionLine = h.added.start -- SIC even for deletions, correctly shifted line is in `.added`
 			local isInFold = deletionLine >= foldstart and deletionLine <= foldend
