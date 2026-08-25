@@ -60,11 +60,11 @@ local function getDiagnosticsInFold(buf, foldstart, foldend)
 
 	-- convert count info into virtual text table for `set_extmark`
 	local chunks = {} ---@type Origami.VirtTextChunk[]
-	for severity = vim.diagnostic.severity.ERROR, vim.diagnostic.severity.HINT do
-		if diagsInFold[severity] > 0 then
+	for level, number in ipairs(diagsInFold) do
+		if number > 0 then
 			table.insert(chunks, { " " }) -- separate, so the padding does not get hlgroup
-			local text = diagIcons[severity] .. diagsInFold[severity]
-			table.insert(chunks, { text, { diagHls[severity] } })
+			local text = diagIcons[level] .. " " .. number
+			table.insert(chunks, { text, { diagHls[level] } })
 		end
 	end
 	return chunks
