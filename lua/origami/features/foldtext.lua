@@ -9,6 +9,7 @@ local ns = vim.api.nvim_create_namespace("origami.foldText")
 ---@field diagnostics vim.Diagnostic[]
 ---@field diagIcons string[]
 ---@field diagHls string[]
+---@field diagIconSeparator string
 ---@field gitsignsHunks? table[] hunks from `gitsigns.get_hunks()`
 ---@field miniDiffHunks? table[] hunks from `MiniDiff.get_buf_data().hunks`
 
@@ -40,6 +41,7 @@ local function getRedrawData(buf, config)
 		diagnostics = {},
 		diagIcons = { "E", "W", "I", "H" },
 		diagHls = { "DiagnosticError", "DiagnosticWarn", "DiagnosticInfo", "DiagnosticHint" },
+		diagIconSeparator = config.foldtext.diagnosticsIconSeparator,
 	}
 
 	local diagnosticsEnabled = vim.diagnostic.is_enabled { bufnr = buf }
@@ -91,7 +93,7 @@ local function getDiagnosticsInFold(data, foldstart, foldend)
 	for severity, count in ipairs(diagsInFold) do
 		if count > 0 then
 			table.insert(chunks, { " " }) -- separate, so the padding does not get hlgroup
-			local text = data.diagIcons[severity] .. count
+			local text = data.diagIcons[severity] .. data.diagIconSeparator .. count
 			table.insert(chunks, { text, { data.diagHls[severity] } })
 		end
 	end

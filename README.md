@@ -94,6 +94,7 @@ require("origami").setup {
 			hlgroup = "Comment",
 		},
 		diagnosticsCount = true, -- uses hlgroups and icons from `vim.diagnostic.config().signs`
+		diagnosticsIconSeparator = " ", -- between diagnostic icon and count
 		gitsignsCount = true, -- requires `gitsigns.nvim` or `mini.diff`
 		disableOnFt = { "snacks_picker_input" }, ---@type string[]
 		priority = nil, ---@type number? extmark priority, `nil` uses nvim's default
