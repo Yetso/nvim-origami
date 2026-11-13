@@ -14,7 +14,7 @@ local ns = vim.api.nvim_create_namespace("origami.foldText")
 ---@class Origami.FoldtextFoldCache
 ---@field foldend number
 ---@field chunks Origami.VirtTextChunk[]
----@field textLength number byte length of all chunks
+---@field textLength number display width of all chunks
 ---@field virtText? Origami.VirtTextChunk[] `chunks` with the padding, if the padding is static
 
 ---Per-buffer cache, so redraws do not re-fetch and re-count everything
@@ -23,12 +23,24 @@ local ns = vim.api.nvim_create_namespace("origami.foldText")
 ---@field diagnosticsEnabled? boolean
 ---@field diagnostics? Origami.FoldtextDiagData
 ---@field gitTick? number `changedtick` when the git hunks were fetched
----@field gitsignsHunks? table[] hunks from `gitsigns.get_hunks()`
----@field miniDiffHunks? table[] hunks from `MiniDiff.get_buf_data().hunks`
+---@field hunks? Origami.Hunk[] hunks from gitsigns or mini.diff, in a common format
+---@field hunkHls? table<string, string> hlgroup per hunk type, matching the git plugin
 ---@field folds table<number, Origami.FoldtextFoldCache> indexed by foldstart
+
+---Hunk of gitsigns or mini.diff, converted to one format so they are counted the same way
+---@class Origami.Hunk
+---@field type "add"|"change"|"delete"
+---@field start number first line of the hunk in the buffer (for deletions: line the deletion is at)
+---@field count number number of lines in the buffer
+---@field removed number number of removed lines
 
 ---@type table<number, Origami.FoldtextBufCache>
 local cache = {}
+
+local hunkHls = {
+	gitsigns = { change = "GitSignsChange", delete = "GitSignsDelete", add = "GitSignsAdd" },
+	minidiff = { change = "MiniDiffSignChange", delete = "MiniDiffSignDelete", add = "MiniDiffSignAdd" },
+}
 
 --------------------------------------------------------------------------------
 
@@ -141,15 +153,26 @@ local function getBufCache(buf, config)
 	local tick = vim.api.nvim_buf_get_changedtick(buf)
 	if config.foldtext.gitsignsCount and bufCache.gitTick ~= tick then
 		bufCache.gitTick = tick
-		bufCache.gitsignsHunks, bufCache.miniDiffHunks = nil, nil
+		bufCache.hunks, bufCache.hunkHls = nil, nil
 		bufCache.folds = {}
 		local gitsignsInstalled, gitsigns = pcall(require, "gitsigns")
 		local minidiffInstalled, MiniDiff = pcall(require, "mini.diff")
+		local hunks = {} ---@type Origami.Hunk[]
 		if gitsignsInstalled then
-			bufCache.gitsignsHunks = gitsigns.get_hunks(buf) or {}
+			for _, h in ipairs(gitsigns.get_hunks(buf) or {}) do
+				-- SIC even for deletions, correctly shifted line is in `.added`
+				hunks[#hunks + 1] =
+					{ type = h.type, start = h.added.start, count = h.added.count, removed = h.removed.count }
+			end
+			bufCache.hunks, bufCache.hunkHls = hunks, hunkHls.gitsigns
 		elseif minidiffInstalled then
 			local bufData = MiniDiff.get_buf_data(buf)
-			bufCache.miniDiffHunks = bufData and bufData.hunks or {}
+			for _, h in ipairs(bufData and bufData.hunks or {}) do
+				-- deletions at the top of the file have `buf_start = 0`
+				local start = (h.type == "delete" and h.buf_start == 0) and 1 or h.buf_start
+				hunks[#hunks + 1] = { type = h.type, start = start, count = h.buf_count, removed = h.ref_count }
+			end
+			bufCache.hunks, bufCache.hunkHls = hunks, hunkHls.minidiff
 		end
 	end
 
@@ -198,20 +221,17 @@ end
 ---@type Origami.FoldtextComponentProvider
 local function getGitHunksInFold(data, foldstart, foldend)
 	local typeIcons = { change = "~", delete = "-", add = "+" }
-	local typeHls = { change = "GitSignsChange", delete = "GitSignsDelete", add = "GitSignsAdd" }
 
 	-- get count by type in the folded lines: for deletions check if deletion is
 	-- in the fold, for additions/changes, calculate the overlap of hunk and fold
 	local hunksInFold = { change = 0, delete = 0, add = 0 }
-	for _, h in ipairs(data.gitsignsHunks) do
+	for _, h in ipairs(data.hunks) do
 		if h.type == "delete" then
-			local deletionLine = h.added.start -- SIC even for deletions, correctly shifted line is in `.added`
-			local isInFold = deletionLine >= foldstart and deletionLine <= foldend
-			if isInFold then hunksInFold["delete"] = hunksInFold["delete"] + h.removed.count end
+			local isInFold = h.start >= foldstart and h.start <= foldend
+			if isInFold then hunksInFold.delete = hunksInFold.delete + h.removed end
 		else
-			local hunkStart = h.added.start
-			local hunkEnd = hunkStart - 1 + h.added.count
-			local overlapStart = math.max(foldstart + 1, hunkStart) -- + 1 since 1st folded line still visible
+			local hunkEnd = h.start - 1 + h.count
+			local overlapStart = math.max(foldstart + 1, h.start) -- + 1 since 1st folded line still visible
 			local overlapEnd = math.min(foldend, hunkEnd)
 			local overlap = overlapEnd - overlapStart + 1
 			if overlap > 0 then hunksInFold[h.type] = hunksInFold[h.type] + overlap end
@@ -220,48 +240,11 @@ local function getGitHunksInFold(data, foldstart, foldend)
 
 	-- convert count info into virtual text table for `set_extmark`
 	local chunks = {} ---@type Origami.VirtTextChunk[]
-	for _, type in pairs { "add", "change", "delete" } do
-		if hunksInFold[type] > 0 then
-			table.insert(chunks, { " " }) -- separate, so the padding does not get hlgroup
-			local text = typeIcons[type] .. hunksInFold[type]
-			table.insert(chunks, { text, { typeHls[type] } })
-		end
-	end
-
-	return chunks
-end
-
----@type Origami.FoldtextComponentProvider
-local function getGitHunksInFoldWithMiniDiff(data, foldstart, foldend)
-	local typeIcons = { change = "~", delete = "-", add = "+" }
-	local typeHls =
-		{ change = "MiniDiffSignChange", delete = "MiniDiffSignDelete", add = "MiniDiffSignAdd" }
-
-	-- get count by type in the folded lines: for deletions check if deletion is
-	-- in the fold, for additions/changes, calculate the overlap of hunk and fold
-	local hunksInFold = { change = 0, delete = 0, add = 0 }
-	for _, h in ipairs(data.miniDiffHunks) do
-		if h.type == "delete" then
-			local deletionLine = h.buf_start > 0 and h.buf_start or 1
-			local isInFold = deletionLine >= foldstart and deletionLine <= foldend
-			if isInFold then hunksInFold["delete"] = hunksInFold["delete"] + h.ref_count end
-		else
-			local hunkStart = h.buf_start
-			local hunkEnd = hunkStart - 1 + h.buf_count
-			local overlapStart = math.max(foldstart + 1, hunkStart)
-			local overlapEnd = math.min(foldend, hunkEnd)
-			local overlap = overlapEnd - overlapStart + 1
-			if overlap > 0 then hunksInFold[h.type] = hunksInFold[h.type] + overlap end
-		end
-	end
-
-	-- Convert counts into virtual text chunks for `set_extmark`
-	local chunks = {} ---@type Origami.VirtTextChunk[]
 	for _, typ in ipairs { "add", "change", "delete" } do
 		if hunksInFold[typ] > 0 then
 			table.insert(chunks, { " " }) -- separate, so the padding does not get hlgroup
 			local text = typeIcons[typ] .. hunksInFold[typ]
-			table.insert(chunks, { text, { typeHls[typ] } })
+			table.insert(chunks, { text, { data.hunkHls[typ] } })
 		end
 	end
 
@@ -291,19 +274,14 @@ local function getFoldCache(data, foldstart, foldend)
 		vim.list_extend(chunks, diagnostics)
 	end
 	if config.foldtext.gitsignsCount then
-		local hunks = {} ---@type Origami.VirtTextChunk[]
-		if data.gitsignsHunks then
-			hunks = getGitHunksInFold(data, foldstart, foldend)
-		elseif data.miniDiffHunks then
-			hunks = getGitHunksInFoldWithMiniDiff(data, foldstart, foldend)
-		end
+		local hunks = data.hunks and getGitHunksInFold(data, foldstart, foldend) or {}
 		if #hunks > 0 then table.insert(chunks, { " " }) end
 		vim.list_extend(chunks, hunks)
 	end
 
 	local textLength = 0
 	for _, chunk in ipairs(chunks) do
-		textLength = textLength + #chunk[1]
+		textLength = textLength + vim.api.nvim_strwidth(chunk[1])
 	end
 
 	cached = { foldend = foldend, chunks = chunks, textLength = textLength }
